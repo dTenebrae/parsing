@@ -1,7 +1,7 @@
 import scrapy
 import json
 import datetime as dt
-from ..items import InstagramPost, InstagramTag
+from gb_parse.items import InstagramUser
 
 
 class InstagramSpider(scrapy.Spider):
@@ -13,14 +13,17 @@ class InstagramSpider(scrapy.Spider):
     csrf_token = ''
     checked_tags = []
     query = {
-        'posts': '56a7068fea504063273cc2120ffd54f3',
-        'tags': "9b498c08113f1e09617a1703c22b2f32",
+        # 'posts': '56a7068fea504063273cc2120ffd54f3',
+        # 'tags': "9b498c08113f1e09617a1703c22b2f32",
+        'edge_followed_by': 'c76146de99bb02f6415203be841dd25a',
+        'edge_follow': 'd04b0a864b4b54837c0d870b0e77e076'
     }
 
-    def __init__(self, login, password, start_tags: list, *args, **kwargs):
+    def __init__(self, login, password, start_users: list, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.start_users = [f'/{user}/' for user in start_users]
         # self.start_tags = [f'/explore/tags/{tag}/' for tag in start_tags]
-        self.start_tags = [f'/explore/tags/{tag}/?__a=1' for tag in start_tags]
+        # self.start_tags = [f'/explore/tags/{tag}/?__a=1' for tag in start_tags]
         self.login = login
         self.password = password
 
@@ -28,6 +31,14 @@ class InstagramSpider(scrapy.Spider):
     def script_data(response) -> dict:
         return json.loads(response.xpath('//script[contains(text(),"window._sharedData")]/text()').get().replace(
             'window._sharedData = ', '').rstrip(';'))
+
+    def get_url(self, user_id, after='', flw='edge_followed_by'):
+        variables = {"id": user_id,
+                     "include_reel": True,
+                     "fetch_mutual": False,  # Показывать общих фолловеров
+                     "first": 100,
+                     "after": after}
+        return f'{self.graphql_url}?query_hash={self.query[flw]}&variables={json.dumps(variables)}'
 
     def parse(self, response, **kwargs):
         # авторизуемся
@@ -49,54 +60,33 @@ class InstagramSpider(scrapy.Spider):
             # Если вывалились в ошибку - есть шанс, что авторизовались
             data = response.json()
             if data['authenticated']:
-                for tag in self.start_tags:
-                    yield response.follow(tag, callback=self.json_parse)
+                for user in self.start_users:
+                    yield response.follow(user, callback=self.user_parse)
 
-    # Вариант с использованием api Instagram'a (В конец строки с тэгом или постом добавляем ?__a=1 - что дает нам JSON
-    # ответ с нужными данными. Чтобы пройтись по пагинации - добавляем после этой строки &max_id={значение end cursor})
-    def json_parse(self, response):
-        js_data = response.json()
-        # Находим хэш конца постов
-        end_cursor = js_data['graphql']['hashtag']['edge_hashtag_to_media']['page_info']['end_cursor']
+    def user_parse(self, response):
+        json_data = self.script_data(response)
+        user_id = json_data['entry_data']['ProfilePage'][0]['graphql']['user']['id']
+        user_name = json_data['entry_data']['ProfilePage'][0]['graphql']['user']['username']
+        # Бежим по хэшам. В мету передаем данные, которые потом используем в сборке итема
+        for flw in self.query.keys():
+            yield response.follow(self.get_url(user_id, flw=flw), callback=self.follow_parse,
+                                  meta={'user_id': user_id, 'user_name': user_name, 'follow': flw})
 
-        # Сохраняем тэг в item(если он отсутствует в пройденых тэгах)
-        tag = js_data["graphql"]["hashtag"]
-        tag_name = tag['name']
-        if tag_name not in self.checked_tags:
-            self.checked_tags.append(tag_name)
-            yield InstagramTag(
-                date_parse=dt.datetime.utcnow(),
-                data={
-                    'id': tag['id'],
-                    'name': tag['name'],
-                    'post_count': tag['edge_hashtag_to_media']['count']
-                },
-                image=tag['profile_pic_url'])
-
-        #  Если есть следующая страница - переходим на нее
-        if js_data['graphql']['hashtag']['edge_hashtag_to_media']['page_info']['has_next_page']:
-            yield response.follow(f'https://www.instagram.com/explore/tags/{tag["name"]}/?__a=1&max_id={end_cursor}',
-                                  callback=self.json_parse)
-
-        # Пробегаем все посты, запихиваем их в item'ы
-        for edge in js_data['graphql']['hashtag']['edge_hashtag_to_media']['edges']:
-            yield InstagramPost(date_parse=dt.datetime.utcnow(), data=edge['node'], image=edge['node']['display_url'])
-
-        # Вариант с отлавливанием хэшей и подстановкой в запрос
-        # def tag_page_parse(self, response):
-        #     try:
-        #         data = self.script_data(response)
-        #         if not self.csrf_token:
-        #             self.csrf_token = data['config']['csrf_token']
-        #         hash_data = data['entry_data']['TagPage'][0]['graphql']
-        #     except Exception:
-        #         hash_data = response.json()
-        #
-        #     variables = {
-        #         "tag_name": hash_data['hashtag']['name'],
-        #         "first": 50,
-        #         "after": hash_data['hashtag']['edge_hashtag_to_media']['page_info']['end_cursor']
-        #     }
-        #     url = f'{self.graphql_url}?query_hash={self.query["tags"]}&variables={json.dumps(variables)}'
-        #     if hash_data['hashtag']['edge_hashtag_to_media']['page_info']['has_next_page']:
-        #         yield response.follow(url, callback=tag_page_parse)
+    def follow_parse(self, response):
+        json_data = response.json()
+        end_cursor = json_data['data']['user'][response.meta['follow']]['page_info']['end_cursor']
+        # Идем по пагинации
+        if json_data['data']['user'][response.meta['follow']]['page_info']['has_next_page']:
+            yield response.follow(
+                self.get_url(user_id=response.meta['user_id'], after=end_cursor, flw=response.meta['follow']),
+                callback=self.follow_parse, meta=response.meta)
+        # Так как путь для followers и followed_by в структуре json меняется - используем это значение из меты
+        for edge in json_data['data']['user'][response.meta['follow']]['edges']:
+            yield InstagramUser(date_parse=dt.datetime.utcnow(),
+                                data={
+                                    'root_user': response.meta['user_name'],
+                                    'root_user_id': response.meta['user_id'],
+                                    'follow_status': response.meta['follow'],
+                                    'node_data': edge['node']
+                                },
+                                image=edge['node']['profile_pic_url'])
