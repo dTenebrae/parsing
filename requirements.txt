@@ -1,0 +1,6 @@
+itemadapter==0.2.0
+itemloaders==1.0.4
+Scrapy==2.4.1
+pymongo==3.11.2
+anytree==2.8.0
+python-dotenv==0.15.0
